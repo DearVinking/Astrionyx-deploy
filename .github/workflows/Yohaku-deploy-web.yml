@@ -1,0 +1,285 @@
+name: Build and Deploy Web
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: Private source repository
+        required: true
+        type: string
+      source_ref:
+        description: Fully qualified source ref
+        required: true
+        type: string
+      source_sha:
+        description: Exact source commit SHA
+        required: true
+        type: string
+      service:
+        description: Service to build
+        required: true
+        type: string
+      deploy_env:
+        description: Deployment environment
+        required: true
+        type: string
+
+concurrency:
+  group: build-and-deploy-${{ inputs.service }}-${{ inputs.deploy_env }}
+  cancel-in-progress: true
+
+env:
+  PNPM_VERSION: 9.x.x
+  NODE_VERSION: '20'
+  KEEP_DEPLOYMENTS: 1
+  RELEASE_FILE: release.zip
+
+jobs:
+  validate-inputs:
+    name: Validate dispatch inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate required values
+        shell: bash
+        env:
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SERVICE: ${{ inputs.service }}
+          DEPLOY_ENV: ${{ inputs.deploy_env }}
+        run: |
+          [ "$SOURCE_REPO" = "DearVinking/<私有仓库B名>" ] || { echo "Unexpected source_repo: $SOURCE_REPO"; exit 1; }
+          [ "$SOURCE_REF" = "refs/heads/main" ] || { echo "Unexpected source_ref: $SOURCE_REF"; exit 1; }
+          [ "$SERVICE" = "web" ] || { echo "Unexpected service: $SERVICE"; exit 1; }
+          [ -n "$SOURCE_SHA" ] || { echo "source_sha is required"; exit 1; }
+          printf '%s' "$SOURCE_SHA" | grep -Eiq '^[0-9a-f]{40}$' || { echo "source_sha must be a full 40-character commit SHA"; exit 1; }
+          [ "$DEPLOY_ENV" = "production" ] || { echo "Unexpected deploy_env: $DEPLOY_ENV"; exit 1; }
+
+  build:
+    name: 构建
+    runs-on: ubuntu-latest
+    needs: validate-inputs
+    outputs:
+      download_url: ${{ steps.upload.outputs.download_url }}
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          fetch-depth: 1
+          lfs: true
+          path: source
+
+      - name: Verify checked out revision
+        shell: bash
+        run: |
+          cd source
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          echo "Checked out $ACTUAL_SHA"
+          [ "$ACTUAL_SHA" = "${{ inputs.source_sha }}" ] || { echo "Checked out unexpected SHA"; exit 1; }
+
+      - run: cd source && git lfs checkout
+
+      - name: 设置 pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: 恢复 Next.js 构建缓存
+        uses: actions/cache@v4
+        with:
+          path: source/.next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('source/pnpm-lock.yaml') }}-${{ hashFiles('source/**/*.{js,jsx,ts,tsx}') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-${{ hashFiles('source/pnpm-lock.yaml') }}-
+            nextjs-${{ runner.os }}-
+
+      - name: 安装依赖
+        working-directory: source
+        run: pnpm install --no-frozen-lockfile
+
+      - name: 生成 ecosystem.standalone.config.cjs
+        working-directory: source
+        run: |
+          cat > apps/web/ecosystem.standalone.config.cjs << 'EOF'
+          const fs   = require('fs')
+          const path = require('path')
+
+          function loadEnvFile(filePath) {
+            try {
+              return Object.fromEntries(
+                fs.readFileSync(filePath, 'utf8').split('\n')
+                  .map(l => l.trim())
+                  .filter(l => l && !l.startsWith('#'))
+                  .map(l => { const i = l.indexOf('='); return [l.slice(0,i).trim(), l.slice(i+1).trim()] })
+              )
+            } catch { return {} }
+          }
+
+          module.exports = {
+            apps: [{
+              name: 'shiro',
+              script: 'server.js',
+              autorestart: true,
+              watch: false,
+              max_memory_restart: '500M',
+              env: {
+                PORT: 2323,
+                NODE_ENV: 'production',
+                NEXT_SHARP_PATH: process.env.NEXT_SHARP_PATH,
+                ...loadEnvFile(path.join(__dirname, '.env')),
+              },
+              log_date_format: 'YYYY-MM-DD HH:mm:ss',
+            }],
+          }
+          EOF
+
+      - name: 构建 & 打包
+        working-directory: source
+        env:
+          API_URL: ${{ secrets.API_URL }}
+          NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+          NEXT_PUBLIC_GATEWAY_URL: ${{ secrets.NEXT_PUBLIC_GATEWAY_URL }}
+        run: bash ci-release-build.sh
+
+      - name: 验证产物完整性
+        working-directory: source
+        run: |
+          if [ ! -f "assets/${{ env.RELEASE_FILE }}" ]; then
+            exit 1
+          fi
+
+      - name: 安装 rclone
+        run: |
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o rclone.zip
+          unzip -q rclone.zip
+          sudo install -m 755 rclone-*-linux-amd64/rclone /usr/local/bin/rclone
+          rclone version
+
+      - name: 上传到 R2（含重试）
+        id: upload
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT_URL }}
+          RCLONE_CONFIG_R2_REGION: auto
+          RCLONE_CONFIG_R2_ACL: private
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+          RCLONE_CONFIG_R2_FORCE_PATH_STYLE: "true"
+        run: |
+          for i in 1 2 3 4 5; do
+            rclone copy source/assets/${{ env.RELEASE_FILE }} r2:${{ secrets.R2_BUCKET }} \
+              --retries 3 --retries-sleep 10s \
+              --s3-upload-cutoff=64M --s3-chunk-size=8M --s3-disable-checksum \
+              && break \
+              || { [ $i -lt 5 ] && sleep 30 || exit 1; }
+          done
+
+          DOWNLOAD_URL="${{ secrets.R2_PUBLIC_URL }}/${{ env.RELEASE_FILE }}"
+          echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: 部署
+    runs-on: ubuntu-latest
+    needs: build
+    environment: ${{ inputs.deploy_env }}
+
+    steps:
+      - name: 安装 rclone
+        run: |
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o rclone.zip
+          unzip -q rclone.zip
+          sudo install -m 755 rclone-*-linux-amd64/rclone /usr/local/bin/rclone
+          rclone version
+
+      - name: 从 R2 获取下载地址
+        id: upload
+        run: |
+          DOWNLOAD_URL="${{ secrets.R2_PUBLIC_URL }}/${{ env.RELEASE_FILE }}"
+          echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+
+      - name: SSH 部署到服务器
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          command_timeout: 10m
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USER }}
+          password: ${{ secrets.PASSWORD }}
+          key: ${{ secrets.KEY }}
+          port: ${{ secrets.PORT }}
+          script: |
+            set -euo pipefail
+            source "$HOME/.bashrc"
+
+            DOWNLOAD_URL="${{ steps.upload.outputs.download_url }}"
+            BASEDIR="$HOME/shiro"
+            WORKDIR="$BASEDIR/${{ github.run_number }}"
+            TMPFILE="/tmp/shiro-release-${{ github.run_number }}.zip"
+
+            for i in 1 2 3 4 5; do
+              wget -q --show-progress --no-check-certificate -O "$TMPFILE" "$DOWNLOAD_URL" \
+                && [ -s "$TMPFILE" ] && break \
+                || { rm -f "$TMPFILE"; [ $i -lt 5 ] && sleep 5 || exit 1; }
+            done
+
+            mkdir -p "$WORKDIR" "$BASEDIR/.cache"
+            unzip -o -q "$TMPFILE" -d "$WORKDIR"
+            rm -f "$TMPFILE"
+
+            rm -f "$WORKDIR/standalone/apps/web/.env"
+            ln -s "$BASEDIR/.env" "$WORKDIR/standalone/apps/web/.env"
+
+            export NEXT_SHARP_PATH="$(npm root -g)/sharp"
+            cp "$WORKDIR/standalone/ecosystem.config.js" "$BASEDIR/ecosystem.config.js"
+
+            ln -sf "$WORKDIR/standalone/apps/web/server.js" "$BASEDIR/server.js"
+            rm -rf "$WORKDIR/standalone/apps/web/.next/cache"
+            ln -sf "$BASEDIR/.cache" "$WORKDIR/standalone/apps/web/.next/cache"
+
+            cd "$BASEDIR"
+            pm2 reload ecosystem.config.js --update-env || pm2 start ecosystem.config.js
+            pm2 save
+
+            echo "${{ github.run_number }}" > "$BASEDIR/current_deployment"
+
+            ls -d "$BASEDIR"/[0-9]* 2>/dev/null \
+              | grep -v "$BASEDIR/${{ github.run_number }}" \
+              | sort -rn \
+              | awk -v keep=${{ env.KEEP_DEPLOYMENTS }} 'NR>keep' \
+              | xargs -r rm -rf
+
+      - name: 执行部署后钩子
+        if: success()
+        env:
+          AFTER_DEPLOY_SCRIPT: ${{ secrets.AFTER_DEPLOY_SCRIPT }}
+        run: |
+          if [ -n "$AFTER_DEPLOY_SCRIPT" ]; then
+            eval "$AFTER_DEPLOY_SCRIPT"
+          fi
+
+      - name: 清理 R2 临时文件
+        if: always()
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT_URL }}
+          RCLONE_CONFIG_R2_REGION: auto
+          RCLONE_CONFIG_R2_ACL: private
+          RCLONE_CONFIG_R2_NO_CHECK_BUCKET: "true"
+        run: |
+          rclone delete r2:${{ secrets.R2_BUCKET }}/${{ env.RELEASE_FILE }}
